@@ -9,7 +9,6 @@ pub fn role_oracle(env: &Env) -> Symbol {
     Symbol::new(env, "ORACLE")
 }
 
-#[allow(dead_code)]
 pub fn role_merchant(env: &Env) -> Symbol {
     Symbol::new(env, "MERCHANT")
 }
