@@ -68,7 +68,7 @@ fn test_merchant_verification() {
     let admin = Address::generate(&env);
     let merchant_id = Address::generate(&env);
 
-    client.initialize(&admin);
+    client.merchant_initialize(&admin);
 
     client.register_merchant(
         &merchant_id,
@@ -95,7 +95,7 @@ fn test_unauthorized_verification() {
     let attacker = Address::generate(&env);
     let merchant_id = Address::generate(&env);
 
-    client.initialize(&admin);
+    client.merchant_initialize(&admin);
 
     client.register_merchant(
         &merchant_id,

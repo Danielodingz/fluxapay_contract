@@ -15,7 +15,7 @@ pub struct Merchant {
 }
 
 #[contracttype]
-pub enum DataKey {
+pub enum MerchantDataKey {
     Merchant(Address),
     Admin,
 }
@@ -23,7 +23,7 @@ pub enum DataKey {
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum Error {
+pub enum MerchantError {
     MerchantAlreadyExists = 1,
     MerchantNotFound = 2,
     Unauthorized = 3,
@@ -34,11 +34,11 @@ pub enum Error {
 #[contractimpl]
 impl MerchantRegistry {
     /// Initialize the contract with an admin address
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
-        if env.storage().persistent().has(&DataKey::Admin) {
-            return Err(Error::AdminAlreadySet);
+    pub fn merchant_initialize(env: Env, admin: Address) -> Result<(), MerchantError> {
+        if env.storage().persistent().has(&MerchantDataKey::Admin) {
+            return Err(MerchantError::AdminAlreadySet);
         }
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&MerchantDataKey::Admin, &admin);
         Ok(())
     }
 
@@ -48,15 +48,15 @@ impl MerchantRegistry {
         merchant_id: Address,
         business_name: String,
         settlement_currency: String,
-    ) -> Result<(), Error> {
+    ) -> Result<(), MerchantError> {
         merchant_id.require_auth();
 
         if env
             .storage()
             .persistent()
-            .has(&DataKey::Merchant(merchant_id.clone()))
+            .has(&MerchantDataKey::Merchant(merchant_id.clone()))
         {
-            return Err(Error::MerchantAlreadyExists);
+            return Err(MerchantError::MerchantAlreadyExists);
         }
 
         let merchant = Merchant {
@@ -70,7 +70,7 @@ impl MerchantRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Merchant(merchant_id), &merchant);
+            .set(&MerchantDataKey::Merchant(merchant_id), &merchant);
 
         Ok(())
     }
@@ -82,7 +82,7 @@ impl MerchantRegistry {
         business_name: Option<String>,
         settlement_currency: Option<String>,
         active: Option<bool>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), MerchantError> {
         merchant_id.require_auth();
 
         let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
@@ -99,28 +99,28 @@ impl MerchantRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Merchant(merchant_id), &merchant);
+            .set(&MerchantDataKey::Merchant(merchant_id), &merchant);
 
         Ok(())
     }
 
     /// Get merchant info
-    pub fn get_merchant(env: Env, merchant_id: Address) -> Result<Merchant, Error> {
+    pub fn get_merchant(env: Env, merchant_id: Address) -> Result<Merchant, MerchantError> {
         Self::get_merchant_internal(&env, &merchant_id)
     }
 
     /// Verify merchant (admin only)
-    pub fn verify_merchant(env: Env, admin: Address, merchant_id: Address) -> Result<(), Error> {
+    pub fn verify_merchant(env: Env, admin: Address, merchant_id: Address) -> Result<(), MerchantError> {
         admin.require_auth();
 
         let stored_admin: Address = env
             .storage()
             .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
 
         if admin != stored_admin {
-            return Err(Error::Unauthorized);
+            return Err(MerchantError::Unauthorized);
         }
 
         let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
@@ -128,16 +128,16 @@ impl MerchantRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Merchant(merchant_id), &merchant);
+            .set(&MerchantDataKey::Merchant(merchant_id), &merchant);
 
         Ok(())
     }
 
     // Helper functions
-    fn get_merchant_internal(env: &Env, merchant_id: &Address) -> Result<Merchant, Error> {
+    fn get_merchant_internal(env: &Env, merchant_id: &Address) -> Result<Merchant, MerchantError> {
         env.storage()
             .persistent()
-            .get(&DataKey::Merchant(merchant_id.clone()))
-            .ok_or(Error::MerchantNotFound)
+            .get(&MerchantDataKey::Merchant(merchant_id.clone()))
+            .ok_or(MerchantError::MerchantNotFound)
     }
 }
