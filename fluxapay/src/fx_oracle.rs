@@ -53,6 +53,7 @@ impl FXOracle {
     }
 
     pub fn get_oracle_admin(env: Env) -> Option<Address> {
+    pub fn get_fx_admin(env: Env) -> Option<Address> {
         AccessControl::get_admin(&env)
     }
 
