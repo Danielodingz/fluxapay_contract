@@ -1,5 +1,6 @@
 use super::merchant_registry::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String};
+use crate::{PaymentProcessor, PaymentProcessorClient, RefundManager, RefundManagerClient};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String, Symbol};
 
 #[test]
 fn test_merchant_registration() {
@@ -160,4 +161,103 @@ fn test_set_kyc_tier_unauthorized() {
 
     // Non-admin tries to set KYC tier
     client.set_kyc_tier(&attacker, &merchant_id, &KycTier::Business);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #4)")]
+fn test_unverified_merchant_cannot_create_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payment_processor = env.register(PaymentProcessor, ());
+    let refund_manager = env.register(RefundManager, ());
+    let merchant_registry = env.register(MerchantRegistry, ());
+
+    let payment_client = PaymentProcessorClient::new(&env, &payment_processor);
+    let refund_client = RefundManagerClient::new(&env, &refund_manager);
+    let merchant_client = MerchantRegistryClient::new(&env, &merchant_registry);
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let usdc_token = env.register_stellar_asset_contract_v2(token_admin).address();
+
+    // Initialize contracts
+    refund_client.initialize_refund_manager(&admin, &usdc_token);
+    payment_client.initialize_payment_processor(&admin);
+    merchant_client.initialize(&admin);
+
+    // Register merchant but DON'T verify them
+    let merchant = Address::generate(&env);
+    merchant_client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "Unverified Merchant"),
+        &String::from_str(&env, "USDC"),
+    );
+
+    // Try to create payment - should fail because merchant is not verified
+    let payment_id = String::from_str(&env, "PAY_01");
+    let amount = 1000i128;
+    let expires_at = env.ledger().timestamp() + 3600;
+
+    // This should panic with Unauthorized error
+    payment_client.create_payment(
+        &payment_id,
+        &merchant,
+        &amount,
+        &Symbol::new(&env, "USDC"),
+        &Address::generate(&env),
+        &expires_at,
+    );
+}
+
+#[test]
+fn test_verified_merchant_can_create_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payment_processor = env.register(PaymentProcessor, ());
+    let refund_manager = env.register(RefundManager, ());
+    let merchant_registry = env.register(MerchantRegistry, ());
+
+    let payment_client = PaymentProcessorClient::new(&env, &payment_processor);
+    let refund_client = RefundManagerClient::new(&env, &refund_manager);
+    let merchant_client = MerchantRegistryClient::new(&env, &merchant_registry);
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let usdc_token = env.register_stellar_asset_contract_v2(token_admin).address();
+
+    // Initialize contracts
+    refund_client.initialize_refund_manager(&admin, &usdc_token);
+    payment_client.initialize_payment_processor(&admin);
+    merchant_client.initialize(&admin);
+
+    // Register and verify merchant
+    let merchant = Address::generate(&env);
+    merchant_client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "Verified Merchant"),
+        &String::from_str(&env, "USDC"),
+    );
+
+    // Manually grant MERCHANT role (simulating what would happen with set_refund_manager_address)
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    // Now create payment should succeed
+    let payment_id = String::from_str(&env, "PAY_01");
+    let amount = 1000i128;
+    let expires_at = env.ledger().timestamp() + 3600;
+
+    let payment = payment_client.create_payment(
+        &payment_id,
+        &merchant,
+        &amount,
+        &Symbol::new(&env, "USDC"),
+        &Address::generate(&env),
+        &expires_at,
+    );
+
+    assert_eq!(payment.payment_id, payment_id);
+    assert_eq!(payment.merchant_id, merchant);
+    assert_eq!(payment.amount, amount);
 }

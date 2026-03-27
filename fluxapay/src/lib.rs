@@ -6,7 +6,7 @@ use soroban_sdk::{
 
 mod access_control;
 pub mod fx_oracle;
-use access_control::{role_oracle, role_settlement_operator, AccessControl};
+use access_control::{role_merchant, role_oracle, role_settlement_operator, AccessControl};
 // Re-export for tests
 #[allow(unused_imports)]
 pub use access_control::AccessControlDataKey;
@@ -615,6 +615,11 @@ impl PaymentProcessor {
         expires_at: u64,
     ) -> Result<PaymentCharge, Error> {
         merchant_id.require_auth();
+
+        // Verify that the merchant has the MERCHANT role (granted on verification)
+        if !AccessControl::has_role(&env, &role_merchant(&env), &merchant_id) {
+            return Err(Error::Unauthorized);
+        }
 
         if amount <= 0 {
             return Err(Error::InvalidAmount);
