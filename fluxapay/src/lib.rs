@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)] // Soroban contractargs macro generates fns exceeding the 7-arg limit
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env,
     MuxedAddress, String, Symbol, Vec,
@@ -162,7 +163,12 @@ const CREATE_PAYMENT_WINDOW_SECS: u64 = 60;
 const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
 
 #[contractimpl]
+#[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl RefundManager {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn initialize_refund_manager(env: Env, admin: Address, usdc_token_address: Address) {
         AccessControl::initialize(&env, admin);
         env.storage()
@@ -275,10 +281,10 @@ impl RefundManager {
 
         // Validate refund amount does not exceed original payment amount
         // First try to get payment from local storage
-        let payment: PaymentCharge = if let Some(local_payment) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
+        let payment: PaymentCharge = if let Some(local_payment) =
+            env.storage()
+                .persistent()
+                .get::<DataKey, PaymentCharge>(&DataKey::Payment(payment_id.clone()))
         {
             local_payment
         } else {
@@ -305,12 +311,12 @@ impl RefundManager {
             return Err(Error::RefundExceedsPayment);
         }
 
-        let counter = Self::get_next_refund_id(&env);
+        let counter = Self::get_next_refund_id(env);
 
         // Build refund ID: "refund_" + counter
         // For simplicity and to avoid complex string manipulation in no_std,
         // we use a match statement for common cases
-        let refund_id = format_id(&env, "refund_", counter);
+        let refund_id = format_id(env, "refund_", counter);
 
         let refund = Refund {
             refund_id: refund_id.clone(),
@@ -334,12 +340,12 @@ impl RefundManager {
             &payment_refunds,
         );
         Self::bump_ttl(
-            &env,
+            env,
             &DataKey::PaymentRefunds(payment_id.clone()),
             LONG_LIVE_TTL,
         );
 
-        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
+        Self::bump_refund_ttl(env, &refund_id, &refund.status);
 
         // Issue #27: emit REFUND/CREATED event
         env.events().publish(
@@ -396,9 +402,7 @@ impl RefundManager {
         env.storage()
             .persistent()
             .set(&DataKey::Refund(refund_id.clone()), &refund);
-        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
-
-        // Issue #27: emit REFUND/COMPLETED event
+        Self::bump_refund_ttl(env, &refund_id, &refund.status);
         env.events().publish(
             (Symbol::new(env, "REFUND"), Symbol::new(env, "COMPLETED")),
             (refund.payment_id, refund_id, refund.amount),
@@ -869,7 +873,12 @@ impl RefundManager {
 }
 
 #[contractimpl]
+#[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl PaymentProcessor {
+    pub fn version() -> u32 {
+        1
+    }
+
     pub fn initialize_payment_processor(env: Env, admin: Address) {
         AccessControl::initialize(&env, admin);
         // Initialize paused state to false
@@ -951,14 +960,14 @@ impl PaymentProcessor {
         let now = env.ledger().timestamp();
         let key = DataKey::MerchantRateLimit(merchant_id.clone());
 
-        let mut state: MerchantCreateRateLimit = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(MerchantCreateRateLimit {
-                last_payment_at: now,
-                count: 0,
-            });
+        let mut state: MerchantCreateRateLimit =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(MerchantCreateRateLimit {
+                    last_payment_at: now,
+                    count: 0,
+                });
 
         if now.saturating_sub(state.last_payment_at) >= CREATE_PAYMENT_WINDOW_SECS {
             state.count = 0;
@@ -978,6 +987,7 @@ impl PaymentProcessor {
     }
 
     #[allow(deprecated)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_payment(
         env: Env,
         payment_id: String,
@@ -1003,11 +1013,14 @@ impl PaymentProcessor {
             .persistent()
             .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
         {
-            let registry_client = crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
             match registry_client.try_get_merchant(&merchant_id) {
                 Ok(Ok(merchant)) => {
                     // Require merchant to be verified (not Unverified) and active
-                    if merchant.kyc_tier == crate::merchant_registry::KycTier::Unverified || !merchant.active {
+                    if merchant.kyc_tier == crate::merchant_registry::KycTier::Unverified
+                        || !merchant.active
+                    {
                         return Err(Error::Unauthorized);
                     }
                 }
@@ -1119,7 +1132,7 @@ impl PaymentProcessor {
 
         let diff = amount_received - payment.amount;
 
-        let new_status = if diff >= 0 && diff <= PAYMENT_TOLERANCE {
+        let new_status = if (0..=PAYMENT_TOLERANCE).contains(&diff) {
             // Exact match or tiny overpay within tolerance → Confirmed
             PaymentStatus::Confirmed
         } else if diff > PAYMENT_TOLERANCE {
