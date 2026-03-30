@@ -2,8 +2,6 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, vec, Address, Env, String, Symbol, Vec,
 };
 
-use crate::{DataKey, Error};
-
 #[contract]
 pub struct MerchantRegistry;
 
@@ -58,7 +56,12 @@ pub enum MerchantError {
 }
 
 #[contractimpl]
+#[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl MerchantRegistry {
+    pub fn version() -> u32 {
+        1
+    }
+
     /// Initialize the contract with an admin address
     pub fn initialize(env: Env, admin: Address) -> Result<(), MerchantError> {
         if env.storage().persistent().has(&MerchantDataKey::Admin) {
