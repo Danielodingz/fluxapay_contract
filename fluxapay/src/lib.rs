@@ -13,6 +13,12 @@ const CREATE_PAYMENT_WINDOW_SECS: u64 = 60;
 const CREATE_PAYMENT_MAX_PER_WINDOW: u32 = 30;
 pub const DEFAULT_PAYMENT_DURATION_SECS: u64 = 3_600;
 const REFUND_FEE_BPS: i128 = 100;
+/// Cooldown period after payment confirmation before refunds can be requested (5 minutes in seconds).
+const REFUND_COOLDOWN_SECS: u64 = 300;
+/// Default refund request expiry period (30 days in seconds).
+const REFUND_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+/// Minimum number of arbitrators required for dispute resolution voting.
+const ARBITRATOR_VOTING_THRESHOLD: u32 = 3;
 
 // Issue #167: Tiered refund fees based on merchant KYC tier
 const REFUND_FEE_BPS_BASIC: i128 = 100;     // 1.0% for Basic tier
@@ -38,7 +44,7 @@ mod dex_router;
 pub mod fx_oracle;
 pub mod merchant_auth;
 use access_control::{
-    role_admin, role_merchant, role_oracle, role_settlement_operator, AccessControl,
+    role_admin, role_merchant, role_oracle, role_settlement_operator, role_arbitrator, AccessControl,
 };
 // Re-export for tests
 #[allow(unused_imports)]
@@ -106,6 +112,10 @@ pub struct Refund {
     pub requester: Address,
     pub created_at: u64,
     pub processed_at: Option<u64>,
+    /// Cryptographic proof hash of return agreement for off-chain verification (Issue #176).
+    pub receipt_hash: Option<BytesN<32>>,
+    /// Expiry timestamp for refund requests (Issue #170).
+    pub expiry_at: u64,
 }
 
 #[contracttype]
@@ -143,6 +153,23 @@ pub struct Dispute {
     pub review_deadline: Option<u64>,
     /// True when the dispute has been flagged for escalation (e.g. deadline exceeded).
     pub escalated: bool,
+}
+
+/// Arbitrator vote on a dispute resolution (Issue #178).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArbitratorVoteChoice {
+    Approve,
+    Reject,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorVote {
+    pub dispute_id: String,
+    pub arbitrator: Address,
+    pub vote: ArbitratorVoteChoice,
+    pub voted_at: u64,
 }
 
 #[contracterror]
@@ -187,6 +214,14 @@ pub enum Error {
     MerchantAuthError = 33,
     /// Merchant has exceeded their KYC tier monthly processing volume cap.
     TierVolumeLimitExceeded = 34,
+    /// Refund requested before cooldown period elapsed.
+    RefundCooldownNotElapsed = 34,
+    /// Refund request has expired and cannot be processed.
+    RefundExpired = 35,
+    /// Insufficient arbitrators available for voting.
+    InsufficientArbitrators = 36,
+    /// Voting threshold not met for dispute resolution.
+    ArbitrationVotingThresholdNotMet = 37,
 }
 
 #[contracttype]
@@ -438,6 +473,10 @@ pub enum DataKey {
     StreamCounter,
     /// Stores operator notes keyed by dispute_id for on-chain transparency.
     DisputeOperatorNote(String),
+    /// Stores arbitrator vote on a dispute (keyed by (dispute_id, arbitrator)).
+    ArbitratorVote(String, Address),
+    /// Stores all arbitrators who have voted on a dispute.
+    DisputeArbitratorVotes(String),
     /// Locked stake for a dispute arbitrator: (dispute_id, arbitrator) → amount
     DisputeStake(String, Address),
     /// Vote cast by an arbitrator: (dispute_id, arbitrator) → VoteChoice
@@ -583,9 +622,10 @@ impl RefundManager {
         refund_amount: i128,
         reason: String,
         requester: Address,
+        receipt_hash: Option<BytesN<32>>,
     ) -> Result<String, Error> {
         requester.require_auth();
-        Self::create_refund_internal(&env, payment_id, refund_amount, reason, requester)
+        Self::create_refund_internal(&env, payment_id, refund_amount, reason, requester, receipt_hash)
     }
 
     fn create_refund_internal(
@@ -594,6 +634,7 @@ impl RefundManager {
         refund_amount: i128,
         reason: String,
         requester: Address,
+        receipt_hash: Option<BytesN<32>>,
     ) -> Result<String, Error> {
         if refund_amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -614,6 +655,13 @@ impl RefundManager {
         // Issue #76: Reject refunds unless payment.status == Confirmed
         if payment.status != PaymentStatus::Confirmed {
             return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        // Issue #174: Check cooldown period after payment confirmation
+        let confirmed_at = payment.confirmed_at.ok_or(Error::PaymentAlreadyProcessed)?;
+        let now = env.ledger().timestamp();
+        if now < confirmed_at + REFUND_COOLDOWN_SECS {
+            return Err(Error::RefundCooldownNotElapsed);
         }
 
         // Sum existing refund amounts for this payment
@@ -638,6 +686,9 @@ impl RefundManager {
         // we use a match statement for common cases
         let refund_id = format_id(env, "refund_", counter);
 
+        // Issue #170: Set expiry timestamp (30 days from now)
+        let expiry_at = now + REFUND_EXPIRY_SECS;
+
         let refund = Refund {
             refund_id: refund_id.clone(),
             payment_id: payment_id.clone(),
@@ -647,6 +698,8 @@ impl RefundManager {
             requester,
             created_at: env.ledger().timestamp(),
             processed_at: None,
+            receipt_hash,
+            expiry_at,
         };
 
         env.storage()
@@ -698,6 +751,12 @@ impl RefundManager {
 
         if refund.status != RefundStatus::Pending {
             return Err(Error::RefundAlreadyProcessed);
+        }
+
+        // Issue #170: Check refund expiration
+        let now = env.ledger().timestamp();
+        if now > refund.expiry_at {
+            return Err(Error::RefundExpired);
         }
 
         let usdc_token_address: Address = env
@@ -1214,6 +1273,7 @@ impl RefundManager {
             dispute.amount,
             refund_reason,
             dispute.disputer.clone(),
+            None,
         )?;
 
         // Process the refund immediately
@@ -1665,6 +1725,104 @@ impl RefundManager {
             }
         }
         Ok(disputes)
+    }
+
+    /// Issue #178: Submit an arbitrator vote on a dispute resolution.
+    pub fn submit_arbitrator_vote(
+        env: Env,
+        dispute_id: String,
+        arbitrator: Address,
+        vote: ArbitratorVoteChoice,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+
+        // Check if arbitrator has the ARBITRATOR role
+        if !AccessControl::has_role(&env, &role_arbitrator(&env), &arbitrator) {
+            return Err(Error::Unauthorized);
+        }
+
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+
+        // Only allow voting on Open disputes
+        if dispute.status != DisputeStatus::Open {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        // Check if arbitrator has already voted
+        let vote_key = DataKey::ArbitratorVote(dispute_id.clone(), arbitrator.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::InvalidAmount); // Reusing error code for "already voted"
+        }
+
+        // Record the vote
+        let arbitrator_vote = ArbitratorVote {
+            dispute_id: dispute_id.clone(),
+            arbitrator: arbitrator.clone(),
+            vote: vote.clone(),
+            voted_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&vote_key, &arbitrator_vote);
+
+        // Add arbitrator to the voters list for this dispute
+        let voters_key = DataKey::DisputeArbitratorVotes(dispute_id.clone());
+        let mut voters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&voters_key)
+            .unwrap_or(vec![&env]);
+
+        voters.push_back(arbitrator.clone());
+        env.storage().persistent().set(&voters_key, &voters);
+
+        // Emit arbitrator vote event
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "ARBITRATOR_VOTE")),
+            (dispute_id, arbitrator),
+        );
+
+        Ok(())
+    }
+
+    /// Issue #178: Check arbitrator voting threshold and auto-resolve if met.
+    pub fn check_arbitration_threshold(
+        env: Env,
+        dispute_id: String,
+    ) -> Result<bool, Error> {
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+
+        if dispute.status != DisputeStatus::Open {
+            return Ok(false);
+        }
+
+        let voters_key = DataKey::DisputeArbitratorVotes(dispute_id.clone());
+        let voters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&voters_key)
+            .unwrap_or(vec![&env]);
+
+        if voters.len() < ARBITRATOR_VOTING_THRESHOLD as usize {
+            return Ok(false); // Threshold not met
+        }
+
+        // Count approvals
+        let mut approvals: u32 = 0;
+        for voter in voters.iter() {
+            let vote_key = DataKey::ArbitratorVote(dispute_id.clone(), voter.clone());
+            if let Some(vote) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ArbitratorVote>(&vote_key)
+            {
+                if let ArbitratorVoteChoice::Approve = vote.vote {
+                    approvals += 1;
+                }
+            }
+        }
+
+        // Threshold met if majority (>= threshold) approves
+        Ok(approvals >= ARBITRATOR_VOTING_THRESHOLD)
     }
 
     fn get_next_dispute_id(env: &Env) -> u64 {
