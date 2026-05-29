@@ -224,6 +224,10 @@ pub enum Error {
     InsufficientArbitrators = 36,
     /// Voting threshold not met for dispute resolution.
     ArbitrationVotingThresholdNotMet = 37,
+    /// Fee proposal has not matured for the required 7 days.
+    FeeProposalNotReady = 38,
+    /// No active fee proposal found.
+    NoFeeProposal = 39,
 }
 
 #[contracttype]
@@ -449,6 +453,13 @@ pub struct WithdrawalRecipient {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeProposal {
+    pub proposed_fee: i128,
+    pub proposed_at: u64,
+}
+
+#[contracttype]
 pub enum DataKey {
     Payment(String),
     MerchantPayments(Address),
@@ -487,6 +498,8 @@ pub enum DataKey {
     DisputeVoteTally(String),
     /// Monthly volume tracker: (merchant_id, month_epoch) → i128 cumulative amount
     MerchantMonthlyVolume(Address, u32),
+    FeeProposal,
+    CurrentFee,
 }
 
 // When building for WASM deployment, only the active contract's #[contractimpl]
@@ -578,6 +591,42 @@ impl RefundManager {
     /// Returns all addresses currently holding the given role (issue #37).
     pub fn get_role_members(env: Env, role: Symbol) -> Vec<Address> {
         AccessControl::get_role_members(&env, &role)
+    }
+
+    pub fn propose_fee_update(env: Env, admin: Address, new_fee: i128) -> Result<(), Error> {
+        admin.require_auth();
+        if Some(admin.clone()) != AccessControl::get_admin(&env) {
+            return Err(Error::Unauthorized);
+        }
+        let proposal = FeeProposal {
+            proposed_fee: new_fee,
+            proposed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::FeeProposal, &proposal);
+        Ok(())
+    }
+
+    pub fn finalize_fee_update(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if Some(admin.clone()) != AccessControl::get_admin(&env) {
+            return Err(Error::Unauthorized);
+        }
+        let proposal: FeeProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeProposal)
+            .ok_or(Error::NoFeeProposal)?;
+
+        let now = env.ledger().timestamp();
+        let seven_days_secs: u64 = 7 * 24 * 60 * 60;
+        if now < proposal.proposed_at + seven_days_secs {
+            return Err(Error::FeeProposalNotReady);
+        }
+
+        env.storage().persistent().set(&DataKey::CurrentFee, &proposal.proposed_fee);
+        env.storage().persistent().remove(&DataKey::FeeProposal);
+
+        Ok(())
     }
 
     /// Register a payment with the refund manager so refund amounts can be validated.
@@ -775,6 +824,12 @@ impl RefundManager {
             .get::<DataKey, PaymentCharge>(&DataKey::Payment(refund.payment_id.clone()))
             .ok_or(Error::PaymentNotFound)?;
 
+        let default_fee_bps = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentFee)
+            .unwrap_or(REFUND_FEE_BPS);
+
         let fee_bps = if let Some(registry_address) = env
             .storage()
             .persistent()
@@ -789,13 +844,13 @@ impl RefundManager {
                         KycTier::Business => REFUND_FEE_BPS_BUSINESS,
                         KycTier::Full => REFUND_FEE_BPS_FULL,
                         KycTier::Basic => REFUND_FEE_BPS_BASIC,
-                        KycTier::Unverified => REFUND_FEE_BPS, // Default 1%
+                        KycTier::Unverified => default_fee_bps, // Default 1% dynamically updated
                     }
                 }
-                _ => REFUND_FEE_BPS, // Default if registry lookup fails
+                _ => default_fee_bps, // Default if registry lookup fails
             }
         } else {
-            REFUND_FEE_BPS // Default if no registry configured
+            default_fee_bps // Default if no registry configured
         };
 
         let fee = refund.amount * fee_bps / 10_000;
@@ -931,7 +986,12 @@ impl RefundManager {
             .ok_or(Error::Unauthorized)?;
         let token_client = token::TokenClient::new(&env, &usdc_token_address);
 
-        let fee = refund_amount * REFUND_FEE_BPS / 10_000;
+        let default_fee_bps = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentFee)
+            .unwrap_or(REFUND_FEE_BPS);
+        let fee = refund_amount * default_fee_bps / 10_000;
         let net_amount = refund_amount - fee;
 
         let mut refund = Self::get_refund_internal(&env, &refund_id)?;
